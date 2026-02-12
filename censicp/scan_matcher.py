@@ -7,84 +7,10 @@ for mobile robot localization and mapping.
 
 import numpy as np
 from .icp import ICP, transform_points
-from .utilities import compose_se2, inverse_se2, downsample_scan
+from .utilities import compose_se2, inverse_se2, downsample_scan, VoxelMap
+from collections import deque
+from scipy.spatial import KDTree
 
-
-# ============================================================================
-# Voxel Grid Map (for data management)
-# ============================================================================
-
-class VoxelMap:
-    """Simple voxel grid for downsampling and deduplication."""
-    
-    def __init__(self, voxel_size=0.1):
-        """
-        Args:
-            voxel_size: size of voxels in meters
-        """
-        self.voxel_size = voxel_size
-        self.points = {}  # Dict mapping voxel coords to point lists
-    
-    def add_points(self, points):
-        """
-        Add points to the map.
-        
-        Args:
-            points: (N, 2) array of points
-            
-        Returns:
-            n_added: number of new voxels populated
-        """
-        n_added = 0
-        
-        for p in points:
-            key = tuple((p / self.voxel_size).astype(int))
-            
-            if key not in self.points:
-                self.points[key] = []
-                n_added += 1
-            
-            self.points[key].append(p)
-        return n_added
-    
-    def get_points(self):
-        """
-        Get all points in the map.
-        
-        Returns:
-            (N, 2) array of points
-        """
-        all_points = []
-        for plist in self.points.values():
-            all_points.extend(plist)
-        
-        if all_points:
-            return np.array(all_points)
-        else:
-            return np.zeros((0, 2))
-    
-    def get_voxel_centers(self):
-        """Get center point of each voxel."""
-        centers = []
-        for voxel, plist in self.points.items():
-            centers.append(np.mean(plist, axis=0))
-        return np.array(centers)
-    
-    def clear(self):
-        """Clear all points."""
-        self.points.clear()
-    
-    def size(self):
-        """Number of occupied voxels."""
-        return len(self.points)
-
-    def get_local_map(self, center, radius):
-        """Get points within radius of center (for faster ICP)."""
-        points = self.get_points()
-        if len(points) == 0:
-            return points
-        distances = np.linalg.norm(points - center[:2], axis=1)
-        return points[distances < radius]
 
 # ============================================================================
 # Scan Matcher
@@ -167,7 +93,7 @@ class ScanMatcher:
         
         # Update representations
         points_world = transform_points(points, *self.pose)
-        self.scan_buffer.append(points_world)
+        self.prev_scan = points_world
         self.global_map.add_points(points_world)
         
         return pose_update
@@ -202,6 +128,7 @@ class FusedScanMatcher(ScanMatcher):
     def __init__(self, global_voxel_size=0.05, odom_weight=0.9,
                  **kwargs):
         super().__init__(global_voxel_size, **kwargs)
+        # self.scan_window = deque(maxlen=1)
         self.odom_weight = odom_weight
 
     def add_ackerman(self, rpm, steer, dt, comp=False,
@@ -243,24 +170,24 @@ class FusedScanMatcher(ScanMatcher):
         Returns:
             pose_update: [dx, dy, dtheta] correction from scan matching
         """
-        # Transform to world frame
-        if downsample_vsize > 0:
-            points = downsample_scan(points, downsample_vsize)
-        points_world = transform_points(points, *self.pose)
-
         # For first scan, just add to map
         if self.prev_scan is None:
-            self.prev_scan = points_world
+            points_world = downsample_scan(points, voxel_size=0.05)
+            self.prev_scan = points_world.copy()
+            # self.scan_window.append(points_world)
             self.global_map.add_points(points_world)
             self.pose_history.append(self.pose.copy())
             return np.array([0.0, 0.0, 0.0])
+
+        # Transform to world frame
+        if downsample_vsize > 0:
+            points = downsample_scan(points, downsample_vsize)
 
         if voxel_map_radius > 0:
             # --- NEW: get local map instead of previous scan ---
             target = self.global_map.get_local_map(self.pose, voxel_map_radius)
 
-            if len(target) < 20:
-                # Fallback to previous scan if map is too sparse
+            if len(target) < 100:
                 target = self.prev_scan
         else:
             # Match to previous scan
@@ -290,7 +217,8 @@ class FusedScanMatcher(ScanMatcher):
 
         # Update representations
         points_world = transform_points(points, *self.pose)
-        self.prev_scan = points_world
+        self.prev_scan = points_world.copy()
+        # self.scan_window.append(points_world)
         self.global_map.add_points(points_world)
 
         return pose_update  # The shift, not the absolute pose. Nice!

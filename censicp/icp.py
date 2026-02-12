@@ -26,22 +26,24 @@ def angle2rot(theta):
 def transform_points(points, tx, ty, theta):
     """
     Transform 2D points by rotation and translation.
-    
+
     Args:
         points: (N, 2) array of points
         tx, ty: translation components
         theta: rotation angle in radians
-        
+
     Returns:
         (N, 2) transformed points
     """
+    points = np.asarray(points, dtype=np.float32)
     cos_theta = np.cos(theta)
     sin_theta = np.sin(theta)
-    
-    R = np.array([[cos_theta, -sin_theta],
-                  [sin_theta, cos_theta]], dtype=np.float32)
-    
-    return points @ R.T + np.array([tx, ty], dtype=np.float32)
+    x = points[:, 0]
+    y = points[:, 1]
+    out = np.empty_like(points)
+    out[:, 0] = cos_theta * x - sin_theta * y + tx
+    out[:, 1] = sin_theta * x + cos_theta * y + ty
+    return out
 
 
 # ============================================================================
@@ -74,42 +76,50 @@ def estimate_normals_pca(points, k=10):  # TODO: SPEED THIS UPPPPPP
     Args:
         points: (N, 2) point cloud
         k: number of neighbors for PCA
-        
+
     Returns:
         normals: (N, 2) unit normal vectors
     """
     n_pts = points.shape[0]
     if n_pts == 0:
-        return np.zeros((0, 2), dtype=np.float32), np.zeros((0,), dtype=np.float32)
-    
+        return np.zeros((0, 2), dtype=np.float32)
+
     k = int(min(max(k, 2), n_pts))
     tree = KDTree(points)
-    _, neighbor_indices = tree.query(points, k=k)
-    
+    _, neighbor_indices = tree.query(points, k=k, workers=-1)
+    if neighbor_indices.ndim == 1:
+        neighbor_indices = neighbor_indices[:, None]
+
+    neigh = points[neighbor_indices]
+    centered = neigh - np.mean(neigh, axis=1, keepdims=True)
+    denom = float(max(centered.shape[1] - 1, 1))
+
+    cov_xx = np.sum(centered[:, :, 0] * centered[:, :, 0], axis=1) / denom
+    cov_xy = np.sum(centered[:, :, 0] * centered[:, :, 1], axis=1) / denom
+    cov_yy = np.sum(centered[:, :, 1] * centered[:, :, 1], axis=1) / denom
+
+    tr = cov_xx + cov_yy
+    disc = np.sqrt(np.maximum((cov_xx - cov_yy) ** 2 + 4.0 * cov_xy ** 2, 0.0))
+    lambda_min = 0.5 * (tr - disc)
+
+    # Eigenvector associated with the smallest eigenvalue.
+    nx = cov_xy
+    ny = lambda_min - cov_xx
+    norm = np.sqrt(nx * nx + ny * ny)
+    stable = norm > 1e-12
+
     normals = np.zeros((n_pts, 2), dtype=np.float32)
-
-    for i, neighbors in enumerate(neighbor_indices):
-        pts = points[neighbors]
-        C = np.cov(pts.T, bias=False)
-        eig_vals, eig_vecs = np.linalg.eigh(C)
-        
-        # Normal is eigenvector with smallest eigenvalue
-        if np.argmin(eig_vals) != 0:
-            print("Found a non-zero min eigenvalue!")
-        n = eig_vecs[:, np.argmin(eig_vals)]
-        n_norm = np.linalg.norm(n)
-        if n_norm > 1e-10:
-            n = n / n_norm
-        normals[i] = n
-
-    return normals
+    normals[stable, 0] = nx[stable] / norm[stable]
+    normals[stable, 1] = ny[stable] / norm[stable]
+    normals[~stable, 0] = 1.0
+    return normals, tree
 
 
 # ============================================================================
 # Correspondence Search
 # ============================================================================
 
-def find_point_correspondences(src, tgt_points, tgt_normals):
+def find_point_correspondences(src, tgt_points, tgt_normals, tgt_tree):
     """
     Find closest point correspondence with optional linearity filtering.
     
@@ -117,14 +127,14 @@ def find_point_correspondences(src, tgt_points, tgt_normals):
         src: (N, 2) source points
         tgt_points: (M, 2) target points
         tgt_normals: (M, 2) target point normals
+        tgt_tree: KDTree of tgt
         
     Returns:
         src_kept: source points (potentially filtered)
         q: matched target points
         normals: normals at matched points
     """
-    tree = KDTree(tgt_points)
-    _, indices = tree.query(src, workers=-1)
+    _, indices = tgt_tree.query(src, workers=-1)
     
     q = tgt_points[indices]
     normals = tgt_normals[indices]
@@ -249,7 +259,7 @@ def apply_loss_weights(residuals, loss_type="huber", loss_param=0.1):
 # PLICP Solver (Censi's Closed-Form Solution)
 # ============================================================================
 
-def solve_plicp(p, q1s, normals, loss_type="huber", loss_param=0.1):
+def old_solve_plicp(p, q1s, normals, loss_type="huber", loss_param=0.1):
     """
     Solve for incremental SE(2) transformation using Censi's method.
     
@@ -365,6 +375,126 @@ def solve_plicp(p, q1s, normals, loss_type="huber", loss_param=0.1):
     return x.astype(np.float32)
 
 
+def solve_plicp(p, q1s, normals, loss_type="huber", loss_param=0.1):
+    """
+    Solve for incremental SE(2) transformation using Censi's method.
+
+    Minimizes: sum_i w_i * (n_i^T * (R(theta)*p_i + t - proj_i))^2
+
+    Subject to: cos^2(theta) + sin^2(theta) = 1
+
+    Uses Lagrange multipliers with a quartic polynomial solution.
+    See Censi (2007) Appendix I.
+
+    Args:
+        p: (N, 2) source points
+        q1s: (N, 2) target segment startpoint
+        normals: (N, 2) unit normals
+        loss_type: robust loss function type
+        loss_param: loss function parameter
+
+    Returns:
+        x: [tx, ty, cos(theta), sin(theta)] SE(2) transformation
+    """
+    if len(p) == 0:
+        return np.zeros(4, dtype=np.float32)
+
+    # Compute residuals and weights
+    residuals = compute_residuals(p, q1s, normals)
+    weights = apply_loss_weights(residuals, loss_type, loss_param)
+
+    px = p[:, 0]
+    py = p[:, 1]
+
+    # Project points to target lines (vectorized).
+    line_dot = np.sum(normals * (p - q1s), axis=1, keepdims=True)
+    q_proj = p - normals * line_dot
+    n = p.shape[0]
+    M_i = np.empty((n, 2, 4), dtype=np.float32)
+    M_i[:, 0, 0] = 1.0
+    M_i[:, 0, 1] = 0.0
+    M_i[:, 0, 2] = px
+    M_i[:, 0, 3] = -py
+    M_i[:, 1, 0] = 0.0
+    M_i[:, 1, 1] = 1.0
+    M_i[:, 1, 2] = py
+    M_i[:, 1, 3] = px
+
+    C = weights[:, None, None] * (normals[:, :, None] * normals[:, None, :])
+
+    M = 2.0 * np.einsum(
+        "nia,nij,njb->ab",
+        M_i, C, M_i,
+        optimize=True, dtype=np.float32
+    )
+    # print(M_i.shape, C.shape, q_proj.shape)
+    g = -2.0 * np.einsum(
+        "nab,nbc,nc->a",
+        M_i.transpose(0, 2, 1), C, q_proj,
+        optimize=True, dtype=np.float32
+    ).reshape(4, 1)
+
+    # Partition M into blocks (Censi Eq. 26)
+    A = M[:2, :2]
+    B = M[:2, 2:]
+    D = M[2:, 2:]
+
+    try:
+        A_inv = inv(A)
+    except np.linalg.LinAlgError:
+        return np.zeros(4, dtype=np.float32)
+
+    S = D - B.T @ A_inv @ B
+    S_det = det(S)
+    S_trace = np.trace(S)
+    S_A = S_det * inv(S)  # Adjugate of S
+
+    # Build quartic polynomial coefficients
+    K2 = np.block([
+        [A_inv @ B @ B.T @ A_inv.T, -A_inv @ B],
+        [-(A_inv @ B).T, np.eye(2)]
+    ])
+
+    K1 = np.block([
+        [A_inv @ B @ S_A @ B.T @ A_inv.T, -A_inv @ B @ S_A],
+        [-(A_inv @ B @ S_A).T, S_A]
+    ])
+
+    K0 = np.block([
+        [A_inv @ B @ S_A.T @ S_A @ B.T @ A_inv.T, -A_inv @ B @ S_A.T @ S_A],
+        [-(A_inv @ B @ S_A.T @ S_A).T, S_A.T @ S_A]
+    ])
+
+    c2_lhs = 4.0 * (g.T @ K2 @ g).item()
+    c1_lhs = 4.0 * (g.T @ K1 @ g).item()
+    c0_lhs = (g.T @ K0 @ g).item()
+
+    # Quartic polynomial: p4*λ^4 + p3*λ^3 + p2*λ^2 + p1*λ + p0 = 0
+    p4 = -16.0
+    p3 = -16.0 * S_trace
+    p2 = c2_lhs - (4.0 * S_trace ** 2 + 8.0 * S_det)
+    p1 = c1_lhs - (4.0 * S_trace * S_det)
+    p0 = c0_lhs - S_det ** 2
+
+    roots = np.roots([p4, p3, p2, p1, p0])
+    real_roots = roots[np.isreal(roots)].real
+
+    if len(real_roots) == 0:
+        return np.zeros(4, dtype=np.float32)
+
+    lambda_opt = np.max(real_roots)
+
+    # Solve for x (Censi Eq. 24)
+    W = np.diag([0.0, 0.0, 1.0, 1.0])
+    H = M + 2.0 * lambda_opt * W
+
+    try:
+        x = solve(-H, g).ravel()
+    except np.linalg.LinAlgError:
+        return np.zeros(4, dtype=np.float32)
+
+    return x.astype(np.float32)
+
 # ============================================================================
 # Main ICP Algorithm
 # ============================================================================
@@ -397,35 +527,33 @@ def ICP(src, tgt, max_iter=50, loss="cauchy", loss_param=0.185, max_dist=1.0,
         raise ValueError("Empty point clouds")
     
     # Prepare target representation
-    tgt_normals = estimate_normals_pca(tgt, k=normal_neighbors)
+    tgt_normals, tgt_tree = estimate_normals_pca(tgt, k=normal_neighbors)
 
     # Initialize transformation
     T_global = np.eye(3, dtype=np.float32)
-    src_hom = np.hstack([src, np.ones((src.shape[0], 1), dtype=np.float32)])
-    
+
     for iteration in range(max_iter):
         # Transform source to current frame
-        src_curr = (T_global @ src_hom.T).T[:, :2]
-        
+        src_curr = src @ T_global[:2, :2].T + T_global[:2, 2]
+
         # Find correspondences
         src_curr, q, normals = find_point_correspondences(
-            src_curr, tgt, tgt_normals
+            src_curr, tgt, tgt_normals, tgt_tree
         )
-        q1s = q
 
         # Trim outliers
-        src_curr, q1s, normals = trim_correspondences(
-            src_curr, q1s, normals, max_dist, mad_sigma
+        src_curr, q, normals = trim_correspondences(
+            src_curr, q, normals, max_dist, mad_sigma
         )
-        
+
         if len(src_curr) < 3:
             if verbose:
                 print(f"[ICP] Iteration {iteration}: Too few correspondences, stopping")
             break
-        
+
         # Solve for incremental transform
         x_opt = solve_plicp(
-            src_curr, q1s, normals, loss, loss_param
+            src_curr, q, normals, loss, loss_param
         )
         
         if x_opt[2] == 0.0 and x_opt[3] == 0.0:
@@ -437,7 +565,7 @@ def ICP(src, tgt, max_iter=50, loss="cauchy", loss_param=0.185, max_dist=1.0,
         dx, dy, c, s = x_opt
         norm_cs = np.sqrt(c * c + s * s)
         c, s = c / (norm_cs + 1e-10), s / (norm_cs + 1e-10)
-        
+
         # Build incremental transform
         T_inc = np.array([
             [c, -s, dx],

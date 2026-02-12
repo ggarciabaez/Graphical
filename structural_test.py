@@ -1,4 +1,6 @@
-"""Run scan matching using FusedScanMatcher"""
+"""
+Run scan matching using FusedScanMatcher
+"""
 
 from mcap_protobuf.reader import read_protobuf_messages
 from censicp.utilities import *
@@ -30,12 +32,12 @@ icp_params = {
 
 # Initialize matcher
 matcher = FusedScanMatcher(
-    global_voxel_size=0.20,
+    global_voxel_size=0.1,
     odom_weight=1.0,        # match old behavior exactly
     **icp_params
 )
 
-rr.init("FusedScanMatcher test")
+rr.init("scan match")
 rr.spawn(memory_limit="50%")
 rr.log("origin", rr.Points3D([0, 0, 0]), static=True)
 
@@ -65,7 +67,7 @@ for msg in mcap:
 
     if prev_time is None:
         prev_time = msg.log_time
-        continue
+        matcher.add_scan(pts[:, :2])  # add the first scan :)
 
     dt = (msg.log_time - prev_time).total_seconds()
     prev_time = msg.log_time
@@ -81,7 +83,7 @@ for msg in mcap:
     )
 
     # --- 3️⃣ Run scan matching ---
-    pose_update = matcher.add_scan(pts[:, :2], 0.0, 0.0)
+    pose_update = matcher.add_scan(pts[:, :2], 0.0, 0.02)
 
     # --- 4️⃣ Visualization ---
     pose = matcher.get_pose()

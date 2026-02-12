@@ -30,7 +30,7 @@ icp_params = {
 odom = np.array([0.0, 0.0, 0.0], dtype=np.float32)
 movement_acc = np.array([0.0, 0.0], dtype=np.float32)
 path_history = []
-scan_window = deque(maxlen=1)
+prev_scan = None
 # NEW: Use a global map instead of scan window
 global_map = VoxelMap(voxel_size=0.20)  # 5cm voxels
 
@@ -51,15 +51,6 @@ def log_pose():
     path_history.append([odom[0], odom[1], 0.0])
     rr.log("world/trajectory", rr.LineStrips3D([path_history], colors=[255, 255, 0], radii=0.))
     rr.log("world/car_marker", rr.Points3D([odom[0], odom[1], 0.0], colors=[255, 0, 0], radii=0.08))
-    """
-    rr.log(
-        "lidar",
-        rr.Transform3D(
-            rotation=rr.RotationAxisAngle(axis=[0, 0, 1], radians=odom[2]),
-            translation=[odom[0], odom[1], 0],
-        ),
-    )
-    """
 
 def get_new_odom(dt, rpm, steer):
     global odom
@@ -93,41 +84,23 @@ for msg in mcap:
         prev_time = msg.log_time
         # Add first scan to map
         curr = pts[:, :2]
-        curr_downsampled = downsample_scan(curr, voxel_size=0.05)
-        curr_world = transform_points(curr_downsampled, *odom)
-        scan_window.append(curr_world)
+        curr_world = downsample_scan(curr, voxel_size=0.05)
+        prev_scan = curr_world
         global_map.add_points(curr_world)
         log_pose()
 
     dt = (msg.log_time - prev_time).total_seconds()
     prev_time = msg.log_time
 
-    # Visualize initial map
-    map_points = global_map.get_points()
-    rr.log(
-        "world/global_map",
-        rr.Points3D(
-            np.hstack((map_points, np.zeros((len(map_points), 1)))),
-            colors=[200, 200, 200],
-            radii=0.02,
-        ),
-    )
-
     # Odometry prediction
     get_new_odom(dt, curr_telem[0]['rpm'], curr_telem[1])
-
     rr.set_time("record_time", timestamp=msg.log_time)
 
     # curr = pts[:, :2]
     curr = downsample_scan(pts[:, :2], voxel_size=0.02)
     # HOLY SHIT WE HAVE A GOOD SCAN MATCH LETS GOOOOOOOOOOOOOOO
-    if len(scan_window) == 0:  # Only match every 5 iterations (?)
-        curr_world = transform_points(curr, *odom)
-        scan_window.append(curr_world)
-        log_pose()
-        continue
     if scan_matching:
-        prev_scan_world = scan_window[0]
+        prev_scan_world = prev_scan
         # prev_scan_world = global_map.get_local_map(odom, 8.0)
 
         # This could skew results since we already added current odometry
@@ -164,7 +137,7 @@ for msg in mcap:
     log_cloud = np.hstack((curr_world, np.zeros((len(curr_world), 1))))
     rr.log("world/pointcloud", rr.Points3D(log_cloud, colors=gen_cmap(log_cloud), radii=0.025))
     added = global_map.add_points(curr_world)
-    scan_window.append(curr_world)
+    prev_scan = curr_world.copy()
 
 
     # Update global map visualization every 10 frames
