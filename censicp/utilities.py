@@ -32,6 +32,7 @@ class VoxelMap:
         if len(points) == 0:
             return points
         distances = np.linalg.norm(points - center[:2], axis=1)
+        print(np.mean(points[distances<radius], axis=0))
         return points[distances < radius]
 
     def size(self):
@@ -39,6 +40,7 @@ class VoxelMap:
 
 
 # Add this downsampling function
+# TODO: this seems a bit heavy, no?
 def downsample_scan(points, voxel_size=0.05):
     """Quick voxel downsampling for a single scan."""
     if len(points) == 0:
@@ -49,7 +51,8 @@ def downsample_scan(points, voxel_size=0.05):
         key = tuple((point / voxel_size).astype(int))
         if key not in voxel_keys:
             voxel_keys[key] = point
-
+    out = np.array(list(voxel_keys.values()))
+    print(len(points), len(out))
     return np.array(list(voxel_keys.values()))
 
 def decodepc(msg):

@@ -6,53 +6,8 @@ for mobile robot localization and mapping.
 """
 
 import numpy as np
-from collections import deque
-from icp import ICP, transform_points, angle2rot
-
-
-# ============================================================================
-# SE(2) Utilities
-# ============================================================================
-
-def inverse_se2(pose):
-    """
-    Compute inverse of SE(2) transformation.
-    
-    Args:
-        pose: [x, y, theta]
-        
-    Returns:
-        [x_inv, y_inv, theta_inv]
-    """
-    x, y, theta = pose
-    c, s = np.cos(theta), np.sin(theta)
-    return np.array([
-        -(x * c + y * s),
-        -(-x * s + y * c),
-        -theta
-    ])
-
-
-def compose_se2(tf, delta):
-    """
-    Compose two SE(2) transformations.
-    
-    Args:
-        tf: [x, y, theta] first pose
-        delta: [dx, dy, dtheta] increment in local frame
-        
-    Returns:
-        [x', y', theta'] composed pose
-    """
-    x, y, th = tf
-    dx, dy, dth = delta
-    
-    c, s = np.cos(th), np.sin(th)
-    return np.array([
-        x + c * dx - s * dy,
-        y + s * dx + c * dy,
-        th + dth
-    ])
+from .icp import ICP, transform_points
+from .utilities import compose_se2, inverse_se2, downsample_scan
 
 
 # ============================================================================
@@ -83,14 +38,13 @@ class VoxelMap:
         n_added = 0
         
         for p in points:
-            voxel = tuple(np.floor(p / self.voxel_size).astype(int))
+            key = tuple((p / self.voxel_size).astype(int))
             
-            if voxel not in self.points:
-                self.points[voxel] = []
+            if key not in self.points:
+                self.points[key] = []
                 n_added += 1
             
-            self.points[voxel].append(p)
-        
+            self.points[key].append(p)
         return n_added
     
     def get_points(self):
@@ -124,64 +78,13 @@ class VoxelMap:
         """Number of occupied voxels."""
         return len(self.points)
 
-
-# ============================================================================
-# Point Cloud Processing
-# ============================================================================
-
-def downsample_scan(points, voxel_size=0.05):
-    """
-    Downsample point cloud using voxel grid.
-    
-    Args:
-        points: (N, 2) point cloud
-        voxel_size: voxel size in meters
-        
-    Returns:
-        (M, 2) downsampled points
-    """
-    voxel_map = VoxelMap(voxel_size)
-    voxel_map.add_points(points)
-    return voxel_map.get_voxel_centers()
-
-
-def filter_range(points, max_range=10.0):
-    """
-    Filter points beyond max range (useful for LiDAR).
-    
-    Args:
-        points: (N, 2) point cloud
-        max_range: maximum range in meters
-        
-    Returns:
-        filtered: (M, 2) points within range
-    """
-    distances = np.linalg.norm(points, axis=1)
-    mask = distances < max_range
-    return points[mask]
-
-
-def filter_angle_sector(points, angles, min_angle=None, max_angle=None):
-    """
-    Filter points by angular sector.
-    
-    Args:
-        points: (N, 2) point cloud
-        angles: (N,) angle for each point (radians)
-        min_angle, max_angle: angular bounds (radians)
-        
-    Returns:
-        filtered: (M, 2) points in sector
-    """
-    mask = np.ones(len(points), dtype=bool)
-    
-    if min_angle is not None:
-        mask &= angles >= min_angle
-    if max_angle is not None:
-        mask &= angles <= max_angle
-    
-    return points[mask]
-
+    def get_local_map(self, center, radius):
+        """Get points within radius of center (for faster ICP)."""
+        points = self.get_points()
+        if len(points) == 0:
+            return points
+        distances = np.linalg.norm(points - center[:2], axis=1)
+        return points[distances < radius]
 
 # ============================================================================
 # Scan Matcher
@@ -194,28 +97,25 @@ class ScanMatcher:
     Maintains both a local buffer of recent scans and a global map.
     """
     
-    def __init__(self, local_buffer_size=5, global_voxel_size=0.05,
+    def __init__(self, global_voxel_size=0.05,
                  **kwargs):
         """
         Args:
             local_buffer_size: number of scans to keep in local buffer
             global_voxel_size: voxel size for global map
-            icp_max_dist: max correspondence distance for ICP
-            icp_loss: loss function for robust matching
         Args for ICP:
+            src: (N, 2) source point cloud
+            tgt: (M, 2) target point cloud
             max_iter: maximum number of iterations
             loss: robust loss function ("huber", "cauchy", "tukey", "fair", "none")
             loss_param: loss function parameter (threshold or scale)
             max_dist: hard distance threshold for correspondences (meters)
-            max_seg_dist: max distance between points to form segment (meters)
-            use_mad: use MAD-based outlier filtering
             mad_sigma: MAD threshold multiplier for outlier rejection
-            use_point_normals: if True, use estimated normals instead of segments
             normal_neighbors: k for PCA-based normal estimation
-            min_linearity: minimum linearity score to accept correspondence
             verbose: print iteration info
+
         """
-        self.scan_buffer = deque(maxlen=local_buffer_size)
+        self.prev_scan=None
         self.global_map = VoxelMap(global_voxel_size)
         self.pose = np.array([0.0, 0.0, 0.0], dtype=np.float32)
         self.pose_history = []
@@ -235,14 +135,14 @@ class ScanMatcher:
         points_world = transform_points(points, *self.pose)
         
         # For first scan, just add to map
-        if len(self.scan_buffer) == 0:
-            self.scan_buffer.append(points_world)
+        if self.prev_scan is None:
+            self.prev_scan = points_world.copy()
             self.global_map.add_points(points_world)
             self.pose_history.append(self.pose.copy())
             return np.array([0.0, 0.0, 0.0])
         
         # Match to previous scan
-        prev_scan = self.scan_buffer[-1]
+        prev_scan = self.prev_scan
         
         # Transform previous scan to current sensor frame
         pose_inv = inverse_se2(self.pose)
@@ -290,6 +190,110 @@ class ScanMatcher:
         self.global_map.clear()
         self.pose = np.array([0.0, 0.0, 0.0], dtype=np.float32)
         self.pose_history.clear()
+
+
+class FusedScanMatcher(ScanMatcher):
+    """
+    Manages scan-to-map and scan-to-scan matching.
+
+    Maintains both a local buffer of recent scans and a global map.
+    """
+
+    def __init__(self, global_voxel_size=0.05, odom_weight=0.9,
+                 **kwargs):
+        super().__init__(global_voxel_size, **kwargs)
+        self.odom_weight = odom_weight
+
+    def add_ackerman(self, rpm, steer, dt, comp=False,
+                     L=0.324, kRPM=(np.pi * 0.05 / (60 * 11.838)), kSteer=22/45):
+        """
+        careful with this one, chief. Adds the wheel odometry into the pose estimate using the Ackerman model.
+        :param rpm: RPM measured
+        :param steer: Steering angle in degrees.
+        :param dt: time between current and last measurement
+        :param comp: True if the pose should be composed into SE2, False if it should be added directly
+        :param L: The wheelbase of the car
+        :param kRPM: Constant to convert from rpm to linear velocity
+        :param kSteer: Constant to modify the steering bounds. Default maps from 45 to 22 deg.
+        :return: The change in pose on the global frame (uses the current pose estimate)
+        """
+        v = kRPM*rpm
+        dx = v*np.cos(self.pose[2])
+        dy = v*np.sin(self.pose[2])
+        dtheta = v/L * np.tan(np.deg2rad(steer*kSteer))
+        delta_pose = np.array([dx, dy, dtheta], dtype=np.float32)*dt
+        self.add_odom(delta_pose, comp)
+        return delta_pose
+
+    def add_odom(self, delta_pose, composition=False):
+        if composition:
+            self.pose = compose_se2(self.pose, delta_pose)
+        else:
+            self.pose += delta_pose
+
+    def add_scan(self, points, voxel_map_radius=0, downsample_vsize=0):
+        """
+        Add a new scan and update map.
+
+        Args:
+            points: (N, 2) new scan in sensor frame
+            voxel_map_radius: Radius to extract nearby points from voxel map. If 0, scan-scan matching is used
+            downsample_vsize: Voxel size to use to downsample the input point cloud. If 0, the full cloud is used.
+
+        Returns:
+            pose_update: [dx, dy, dtheta] correction from scan matching
+        """
+        # Transform to world frame
+        if downsample_vsize > 0:
+            points = downsample_scan(points, downsample_vsize)
+        points_world = transform_points(points, *self.pose)
+
+        # For first scan, just add to map
+        if self.prev_scan is None:
+            self.prev_scan = points_world
+            self.global_map.add_points(points_world)
+            self.pose_history.append(self.pose.copy())
+            return np.array([0.0, 0.0, 0.0])
+
+        if voxel_map_radius > 0:
+            # --- NEW: get local map instead of previous scan ---
+            target = self.global_map.get_local_map(self.pose, voxel_map_radius)
+
+            if len(target) < 20:
+                # Fallback to previous scan if map is too sparse
+                target = self.prev_scan
+        else:
+            # Match to previous scan
+            target = self.prev_scan
+
+        # Transform previous scan to current sensor frame
+        pose_inv = inverse_se2(self.pose)
+        target_local = transform_points(target, *pose_inv)
+
+        # Run ICP
+        T = ICP(
+            points, target_local,
+            **self.icp_args
+        )
+
+        # Extract pose update
+        pose_update = np.array([
+            T[0, 2],
+            T[1, 2],
+            np.arctan2(T[1, 0], T[0, 0])
+        ], dtype=np.float32)
+
+        # Update global pose
+        # TODO: right here, officer. This guy extracts the pose from an SE2 to turn it back into an SE2.
+        self.pose = compose_se2(self.pose, pose_update*self.odom_weight)
+        self.pose_history.append(self.pose.copy())
+
+        # Update representations
+        points_world = transform_points(points, *self.pose)
+        self.prev_scan = points_world
+        self.global_map.add_points(points_world)
+
+        return pose_update  # The shift, not the absolute pose. Nice!
 
 
 # ============================================================================
@@ -342,17 +346,13 @@ class OdometryCorrector:
         return self.pose.copy()
 
 
-# ============================================================================
-# Example Usage (if running as main)
-# ============================================================================
-
 if __name__ == "__main__":
     # Demonstrate the scan matcher
     print("Scan Matching Demo")
     print("=" * 60)
     
     # Create matcher
-    matcher = ScanMatcher(local_buffer_size=5, global_voxel_size=0.05)
+    matcher = ScanMatcher(global_voxel_size=0.05)
     
     # Generate fake scans
     np.random.seed(42)
